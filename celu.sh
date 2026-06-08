@@ -1,8 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-#  SETUP CELULAR - Auto configurador completo
+#  SETUP CELULAR v2.2 — Multi-celular
 #  Instala sshd + tunnel reverso al VPS
-#  Correr en Termux: bash setup_cel.sh
+#  Cada cel usa un puerto tunnel distinto
+#  Correr en Termux: bash celu.sh
 # ============================================================
 
 set -e
@@ -16,30 +17,39 @@ err()  { echo -e "${RED}[ERR]${NC} $1"; exit 1; }
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   SETUP CELULAR  v2.0                ║${NC}"
+echo -e "${BOLD}║   SETUP CELULAR  v2.2                ║${NC}"
 echo -e "${BOLD}║   SSH + Tunnel Reverso a VPS         ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════╝${NC}"
 echo ""
 
-# ── Datos del VPS ─────────────────────────────────────────────
+# ── Datos del VPS (fijos) ─────────────────────────────────────
 VPS_IP="3.128.129.120"
 VPS_USER="tunnel"
 VPS_PORT="22"
-TUNNEL_PORT="19999"   # Puerto en el VPS donde quedará expuesto el cel
+
+# ── Puerto tunnel (diferente para cada cel) ───────────────────
+echo -e "${YELLOW}━━━ CONFIGURACIÓN DEL PUERTO ━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+echo -e "  Cada celular necesita un puerto único en el VPS."
+echo -e "  Primer cel: ${CYAN}19999${NC}"
+echo -e "  Segundo cel: ${CYAN}19998${NC}"
+echo -e "  Tercer cel: ${CYAN}19997${NC}  ...etc"
+echo ""
+read -p "  Puerto tunnel para ESTE cel [default 19999]: " INPUT_PORT
+TUNNEL_PORT="${INPUT_PORT:-19999}"
+echo ""
 
 # ── 1. Paquetes ──────────────────────────────────────────────
 info "Actualizando paquetes..."
 pkg update -y -q && pkg upgrade -y -q 2>/dev/null
 info "Instalando dependencias..."
-pkg install -y -q openssh rsync iproute2 termux-api autossh 2>/dev/null
+pkg install -y -q openssh rsync iproute2 termux-api autossh termux-services cronie 2>/dev/null
 log "Paquetes listos"
 
 # ── 2. Almacenamiento ────────────────────────────────────────
 if [ ! -d "$HOME/storage/dcim" ]; then
     warn "Configurando permisos de almacenamiento..."
-    echo ""
     echo -e "${YELLOW}>>> ACEPTA EL POPUP EN TU PANTALLA <<<${NC}"
-    echo ""
     termux-setup-storage
     sleep 8
     [ ! -d "$HOME/storage/dcim" ] && err "No se otorgaron permisos. Vuelve a correr el script."
@@ -51,9 +61,8 @@ info "Configurando SSH..."
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 
 [ ! -f ~/.ssh/id_ed25519 ] && ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q
-log "Llave SSH del cel lista"
+log "Llave SSH lista"
 
-# sshd config — solo llaves, sin contraseña
 mkdir -p $PREFIX/etc/ssh
 cat > $PREFIX/etc/ssh/sshd_config << 'SSHD'
 Port 8022
@@ -74,11 +83,7 @@ log "sshd corriendo en puerto 8022"
 
 # ── 4. Instalar llave del VPS en el cel ──────────────────────
 info "Instalando llave del VPS en el celular..."
-
-# Llave pública del usuario tunnel del VPS
-# Esta llave fue generada por setup_vps.sh
 VPS_TUNNEL_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAWXCv+THPKtTZAcNyP7Fyrz2s81E3CsuHmldCHXRn7p tunnel@ip-172-31-40-218"
-
 if ! grep -qF "$VPS_TUNNEL_PUBKEY" ~/.ssh/authorized_keys 2>/dev/null; then
     echo "$VPS_TUNNEL_PUBKEY" >> ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
@@ -87,39 +92,30 @@ else
     log "Llave del VPS ya existía, skip"
 fi
 
-# ── 5. Instalar llave del cel en el VPS ──────────────────────
-info "Instalando llave del cel en el VPS..."
+# ── 5. Intentar instalar llave del cel en el VPS ─────────────
+# Nota: esto normalmente falla la primera vez porque la llave del cel
+# no está en el VPS todavía. compu.sh v2.2 lo hace automáticamente.
+info "Intentando instalar llave del cel en el VPS..."
 CEL_PUBKEY=$(cat ~/.ssh/id_ed25519.pub)
-
-# Intentar instalar automáticamente (requiere que el VPS tenga puerto 22 abierto)
 ssh -o ConnectTimeout=10 \
     -o StrictHostKeyChecking=no \
     -o PasswordAuthentication=no \
     -p "$VPS_PORT" "$VPS_USER@$VPS_IP" \
-    "mkdir -p ~/.ssh && echo '$CEL_PUBKEY' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" 2>/dev/null && \
-    log "Llave del cel instalada en VPS" || \
-    warn "No se pudo instalar llave en VPS automáticamente (se necesita correr setup_compu.sh primero)"
+    "mkdir -p ~/.ssh && echo '$CEL_PUBKEY' >> ~/.ssh/authorized_keys && sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" 2>/dev/null && \
+    log "Llave del cel instalada en VPS ✓" || \
+    warn "No se pudo instalar en VPS (normal si es el primer cel — compu.sh v2.2 lo hará automáticamente)"
 
-# ── 6. Crear script de tunnel reverso ────────────────────────
-info "Configurando tunnel reverso..."
-
+# ── 6. Script de tunnel reverso (uso manual / respaldo) ──────
+info "Creando script de tunnel reverso..."
 cat > ~/tunnel_reverso.sh << TUNNEL
 #!/data/data/com.termux/files/usr/bin/bash
-# Tunnel reverso al VPS
-# Este script mantiene una conexión permanente al VPS
-# El VPS expone el puerto $TUNNEL_PORT que apunta al sshd de este cel (8022)
-
-VPS_IP="$VPS_IP"
-VPS_USER="$VPS_USER"
-TUNNEL_PORT="$TUNNEL_PORT"
+VPS_IP="${VPS_IP}"
+VPS_USER="${VPS_USER}"
+TUNNEL_PORT="${TUNNEL_PORT}"
 CEL_PORT="8022"
 
 while true; do
-    # Verificar que hay internet antes de intentar
     ping -c 1 -W 3 8.8.8.8 > /dev/null 2>&1 || { sleep 30; continue; }
-
-    # autossh mantiene el tunnel vivo automáticamente
-    # -R: expone el puerto 8022 del cel como 19999 en el VPS
     autossh -M 0 \
         -N \
         -R \${TUNNEL_PORT}:localhost:\${CEL_PORT} \
@@ -130,27 +126,67 @@ while true; do
         -o ExitOnForwardFailure=yes \
         -o ConnectTimeout=10 \
         "\${VPS_USER}@\${VPS_IP}" 2>/dev/null
-
-    sleep 10  # esperar antes de reconectar
+    sleep 10
 done
 TUNNEL
 chmod +x ~/tunnel_reverso.sh
 log "Script de tunnel creado"
 
-# ── 7. Autostart: sshd + tunnel al arrancar el cel ───────────
+# ── 7. Configurar termux-services (autostart al abrir Termux) ─
+info "Configurando servicios con termux-services..."
+
+# sshd como servicio supervisado
+mkdir -p ~/.termux/service/sshd
+printf '#!/data/data/com.termux/files/usr/bin/sh\nexec /data/data/com.termux/files/usr/sbin/sshd -D\n' \
+    > ~/.termux/service/sshd/run
+chmod +x ~/.termux/service/sshd/run
+sv-enable sshd 2>/dev/null && log "sshd habilitado en sv" || warn "sv-enable sshd falló"
+
+# tunnel como servicio supervisado (usa el puerto configurado arriba)
+mkdir -p ~/.termux/service/tunnel
+cat > ~/.termux/service/tunnel/run << SV_TUNNEL
+#!/data/data/com.termux/files/usr/bin/sh
+VPS_IP="${VPS_IP}"
+VPS_USER="${VPS_USER}"
+TUNNEL_PORT="${TUNNEL_PORT}"
+sleep 10
+exec autossh -M 0 \
+    -N \
+    -R \${TUNNEL_PORT}:localhost:8022 \
+    -i \$HOME/.ssh/id_ed25519 \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o StrictHostKeyChecking=no \
+    -o ExitOnForwardFailure=yes \
+    -o ConnectTimeout=10 \
+    \${VPS_USER}@\${VPS_IP}
+SV_TUNNEL
+chmod +x ~/.termux/service/tunnel/run
+sv-enable tunnel 2>/dev/null && log "tunnel habilitado en sv (puerto $TUNNEL_PORT)" || warn "sv-enable tunnel falló"
+
+# Iniciar runsvdir si no está corriendo
+if ! pgrep -x runsvdir > /dev/null 2>&1; then
+    runsvdir ~/.termux/service &
+    sleep 3
+    log "runsvdir iniciado"
+else
+    sv restart sshd  2>/dev/null || true
+    sv restart tunnel 2>/dev/null || true
+    log "Servicios reiniciados"
+fi
+
+# ── 8. Boot script (para Termux:Boot) ────────────────────────
 mkdir -p ~/.termux/boot
 cat > ~/.termux/boot/01_start_services.sh << 'BOOT'
 #!/data/data/com.termux/files/usr/bin/bash
 termux-wake-lock
-sleep 5
-sshd
-sleep 3
-bash ~/tunnel_reverso.sh &
+sleep 8
+pgrep -x runsvdir > /dev/null 2>&1 || runsvdir ~/.termux/service &
 BOOT
 chmod +x ~/.termux/boot/01_start_services.sh
-log "Autostart configurado"
+log "Boot script configurado"
 
-# ── 8. Escanear carpetas de imágenes ─────────────────────────
+# ── 9. Escanear carpetas ──────────────────────────────────────
 info "Escaneando carpetas..."
 CARPETAS_ENCONTRADAS=()
 for CARPETA in \
@@ -171,7 +207,6 @@ for CARPETA in \
     fi
 done
 
-# Guardar config para que la compu la lea
 INFO_FILE="$HOME/storage/shared/.termux_backup_config"
 cat > "$INFO_FILE" << CONF
 PHONE_USER=$(whoami)
@@ -185,19 +220,16 @@ for C in "${CARPETAS_ENCONTRADAS[@]}"; do echo "    \"$C\"" >> "$INFO_FILE"; don
 echo ")" >> "$INFO_FILE"
 log "Config guardada"
 
-# ── 9. Levantar tunnel ahora mismo ───────────────────────────
-info "Levantando tunnel al VPS..."
-pkill -f tunnel_reverso.sh 2>/dev/null || true
-bash ~/tunnel_reverso.sh &
+# ── 10. Verificar tunnel ─────────────────────────────────────
+info "Verificando tunnel en puerto $TUNNEL_PORT..."
 sleep 5
-
-# Verificar tunnel
 if ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no \
     -o BatchMode=yes -p "$VPS_PORT" "$VPS_USER@$VPS_IP" \
     "ss -tlnp | grep -q $TUNNEL_PORT" 2>/dev/null; then
     log "Tunnel activo en VPS:$TUNNEL_PORT ✓"
 else
-    warn "Tunnel aún conectando... espera 30 seg y corre: bash ~/tunnel_reverso.sh &"
+    warn "Tunnel aún conectando... runit lo levantará en ~10-15 seg"
+    warn "Si falló la instalación de llave: compu.sh v2.2 lo corrige al correrlo"
 fi
 
 # ── Resumen ───────────────────────────────────────────────────
@@ -216,11 +248,18 @@ echo -e "  ${CYAN}VPS puente     :${NC} $VPS_IP"
 echo -e "  ${CYAN}Puerto tunnel  :${NC} $TUNNEL_PORT"
 echo -e "  ${CYAN}Carpetas       :${NC} ${#CARPETAS_ENCONTRADAS[@]} detectadas"
 echo ""
-echo -e "${YELLOW}━━━ LLAVE PÚBLICA DE ESTE CEL (para setup_compu.sh) ━━${NC}"
+echo -e "${YELLOW}━━━ LLAVE PÚBLICA DE ESTE CEL ━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${GREEN}$(cat ~/.ssh/id_ed25519.pub)${NC}"
 echo ""
 echo -e "${YELLOW}━━━ SIGUIENTE PASO ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "  Corre ${BOLD}setup_compu.sh${NC} en tu WSL"
-echo -e "  Instala ${BOLD}Termux:Boot${NC} desde F-Droid para autostart"
+echo -e "  Corre ${BOLD}compu.sh${NC} en WSL — pegá esta llave cuando lo pida"
+echo -e "  Usá el mismo puerto: ${BOLD}${TUNNEL_PORT}${NC}"
+echo ""
+echo -e "${YELLOW}━━━ AUTOSTART ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "  ${GREEN}✓ Abrís Termux → sshd + tunnel arrancan solos${NC}"
+echo -e "  ${YELLOW}⚡ Tras reboot → instalar Termux:Boot desde F-Droid${NC}"
+echo -e "    ${CYAN}https://f-droid.org/packages/com.termux.boot/${NC}"
+echo ""
+echo -e "  Verificar servicios: ${BOLD}sv status sshd tunnel${NC}"
 echo ""
