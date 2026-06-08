@@ -1,15 +1,8 @@
 #!/bin/bash
 # ============================================================
-#  SETUP COMPU (WSL) v2.3 — Multi-celular, todos los bugs corregidos
-#  Bugs corregidos vs versiones anteriores:
-#  - CEL_PUBKEY ahora se instala en VPS tunnel user
-#  - Llave default del WSL agregada al VPS (fix ProxyJump)
-#  - SSH usa localhost en vez del IP externo del VPS
-#  - rsync dry-run con --itemize-changes (fix contador de archivos)
-#  - rsync con --include="*/" para recursión en subdirectorios
-#  - Eliminado || echo 0 que causaba "integer expression expected"
-#  - Eliminado --remove-source-files (no borra fotos del cel)
-#  Correr en Ubuntu WSL: bash compu.sh
+#  SETUP COMPU v3.0 — Setup único, detecta todos los cels solo
+#  Correr UNA SOLA VEZ en WSL: bash compu.sh
+#  Los nuevos cels se detectan automáticamente después
 # ============================================================
 
 set -e
@@ -23,318 +16,244 @@ err()  { echo -e "${RED}[ERR]${NC} $1"; exit 1; }
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   SETUP COMPU  v2.3 — Multi-cel     ║${NC}"
-echo -e "${BOLD}║   Backup via VPS Puente              ║${NC}"
+echo -e "${BOLD}║   SETUP COMPU  v3.0 — Setup Único   ║${NC}"
+echo -e "${BOLD}║   Detecta todos los cels solo        ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════╝${NC}"
 echo ""
 
-# ── Config fija del VPS ───────────────────────────────────────
+# ── 1. Config del VPS ─────────────────────────────────────────
 VPS_IP="3.128.129.120"
 VPS_USER="tunnel"
 VPS_SSH_PORT="22"
-CEL_PORT="8022"
 
-# ── Buscar .pem automáticamente ──────────────────────────────
-info "Buscando llave .pem de AWS..."
-PEM_FILE=""
+# ── 2. Buscar MAL.pem ────────────────────────────────────────
+info "Buscando MAL.pem..."
+PEM_KEY=""
 for F in ~/.ssh/MAL.pem ~/.ssh/*.pem; do
-    [ -f "$F" ] && PEM_FILE="$F" && break
+    [ -f "$F" ] && PEM_KEY="$F" && break
 done
-
-if [ -n "$PEM_FILE" ]; then
-    chmod 400 "$PEM_FILE"
-    log "Llave AWS: $PEM_FILE"
-    PEM_KEY="$PEM_FILE"
+if [ -n "$PEM_KEY" ]; then
+    chmod 400 "$PEM_KEY"
+    log "Llave AWS: $PEM_KEY"
 else
-    warn "No se encontró .pem automáticamente."
-    read -p "  Ruta completa al .pem: " PEM_PATH
-    [ ! -f "$PEM_PATH" ] && err "No encontrado: $PEM_PATH"
-    PEM_KEY="$PEM_PATH"
+    read -p "  Ruta al archivo .pem: " PEM_KEY
+    [ ! -f "$PEM_KEY" ] && err "No encontrado: $PEM_KEY"
+    chmod 400 "$PEM_KEY"
 fi
 
-# ── Datos del celular ─────────────────────────────────────────
+# ── 3. Carpeta base de backups ────────────────────────────────
 echo ""
-echo -e "${YELLOW}━━━ DATOS DEL CELULAR A AGREGAR ━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "  Carpeta base donde se guardarán las fotos."
+echo -e "  Cada cel tendrá su propia subcarpeta: BASE_DIR/nombre_cel/"
 echo ""
+read -p "  Carpeta base (ej: /mnt/f/BACKUPS): " BASE_DEST_DIR
+[ -z "$BASE_DEST_DIR" ] && err "La carpeta no puede estar vacía"
+mkdir -p "$BASE_DEST_DIR"
+log "Carpeta base: $BASE_DEST_DIR"
 
-# Detectar próximo puerto disponible
-PUERTOS_USADOS=$(grep -h "^TUNNEL_PORT=" ~/.phone_backup_*.conf 2>/dev/null | \
-    grep -oP '\d+' | sort -rn || true)
-SIGUIENTE_PUERTO=19999
-for P in $PUERTOS_USADOS; do
-    [ "$P" -le "$SIGUIENTE_PUERTO" ] && SIGUIENTE_PUERTO=$((P - 1))
-done
-
-if ls ~/.phone_backup_*.conf 2>/dev/null | head -1 | grep -q conf; then
-    echo -e "  ${CYAN}Celulares ya configurados:${NC}"
-    for F in ~/.phone_backup_*.conf; do
-        N=$(grep "^PHONE_NAME=" "$F" | cut -d'"' -f2)
-        P=$(grep "^TUNNEL_PORT=" "$F" | cut -d'"' -f2)
-        D=$(grep "^DEST_DIR=" "$F" | cut -d'"' -f2)
-        echo -e "    • ${N} → puerto ${P} → ${D}"
-    done
-    echo ""
-fi
-
-read -p "  Nombre para este cel (ej: samsung, moto, cel2): " PHONE_NAME
-PHONE_NAME=$(echo "$PHONE_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '_')
-[ -z "$PHONE_NAME" ] && err "El nombre no puede estar vacío"
-
-echo -e "  Puerto sugerido: ${CYAN}${SIGUIENTE_PUERTO}${NC}"
-read -p "  Puerto tunnel [Enter para $SIGUIENTE_PUERTO]: " INPUT_PORT
-TUNNEL_PORT="${INPUT_PORT:-$SIGUIENTE_PUERTO}"
-
-read -p "  Usuario Termux del cel (ej: u0_a447): " PHONE_USER
-read -p "  Ruta destino fotos (ej: /mnt/f/CEL_NOMBRE): " DEST_DIR
-echo ""
-echo -e "  Pega la llave pública del celular (de celu.sh):"
-read -p "  > " CEL_PUBKEY
-[ -z "$CEL_PUBKEY" ] && err "La llave pública no puede estar vacía"
-
-mkdir -p "$DEST_DIR"
-log "Carpeta destino: $DEST_DIR"
-
-# ── Generar/reusar llave SSH de la compu ─────────────────────
+# ── 4. Generar llave SSH backup ───────────────────────────────
 info "Configurando llaves SSH..."
 SSH_KEY="$HOME/.ssh/id_ed25519_backup"
-if [ ! -f "$SSH_KEY" ]; then
-    ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "backup@compu" -q
-    log "Llave backup generada"
-else
-    log "Llave backup ya existe, reutilizando"
-fi
-COMPU_PUBKEY=$(cat "$SSH_KEY.pub")
+[ ! -f "$SSH_KEY" ] && ssh-keygen -t ed25519 -N "" -f "$SSH_KEY" -C "backup@compu" -q && log "Llave backup generada" || log "Llave backup ya existe"
+BACKUP_PUBKEY=$(cat "$SSH_KEY.pub")
 
-# ── Instalar llaves en VPS tunnel user ────────────────────────
-# Fix crítico: instalar COMPU + CEL + WSL default key
-# La llave default del WSL es necesaria para el ProxyJump
-# (SSH usa la llave del sistema para el salto, no la -i especificada)
-info "Instalando llaves en el VPS (compu + cel + wsl)..."
-WSL_KEYS=""
+# ── 5. Subir llaves del WSL al VPS ───────────────────────────
+# Estas llaves se distribuyen automáticamente a cada cel que se registre
+info "Subiendo llaves WSL al VPS (para auto-distribución a cels)..."
+
+# Recolectar todas las llaves del WSL
+WSL_KEYS="$BACKUP_PUBKEY"
 for PUB in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
-    [ -f "$PUB" ] && WSL_KEYS="$WSL_KEYS\necho \"$(cat $PUB)\" >> ~/.ssh/authorized_keys"
+    [ -f "$PUB" ] && KEY=$(cat "$PUB") && WSL_KEYS="$WSL_KEYS"$'\n'"$KEY"
 done
 
-ssh -i "$PEM_KEY" \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=10 \
-    ubuntu@$VPS_IP \
+# Subir al VPS — los cels las recibirán en su registro
+ssh -i "$PEM_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$VPS_IP \
     "sudo -u tunnel bash -c '
-        mkdir -p ~/.ssh
-        echo \"$COMPU_PUBKEY\" >> ~/.ssh/authorized_keys
-        echo \"$CEL_PUBKEY\" >> ~/.ssh/authorized_keys
-        $(echo -e "$WSL_KEYS")
-        sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys
-        chmod 600 ~/.ssh/authorized_keys
-        echo \"Llaves instaladas: \$(wc -l < ~/.ssh/authorized_keys)\"
-    '" 2>/dev/null && \
-    log "Llaves instaladas en VPS ✓" || \
-    warn "No se pudo instalar en VPS automáticamente"
+        echo \"$WSL_KEYS\" | sort -u > /home/tunnel/keys/wsl_keys
+        chmod 600 /home/tunnel/keys/wsl_keys
+        echo \"WSL keys: \$(wc -l < /home/tunnel/keys/wsl_keys) llaves\"
+    '" 2>/dev/null && log "Llaves WSL subidas al VPS ✓" || warn "No se pudo subir llaves al VPS"
 
-# ── Instalar llave de la compu en el cel (via VPS tunnel) ────
-info "Instalando llave de la compu en ${PHONE_NAME}..."
-# IMPORTANTE: usar localhost como destino (no VPS_IP externo)
-# El security group de AWS bloquea conexiones del VPS a su propio IP externo
-ssh -i "$SSH_KEY" \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=10 \
-    -o BatchMode=yes \
-    -J $VPS_USER@$VPS_IP:$VPS_SSH_PORT \
-    -p $TUNNEL_PORT \
-    $PHONE_USER@localhost \
-    "mkdir -p ~/.ssh && echo '$COMPU_PUBKEY' >> ~/.ssh/authorized_keys && \
-     sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys && \
-     chmod 600 ~/.ssh/authorized_keys" \
-    2>/dev/null && \
-    log "Llave instalada en ${PHONE_NAME} via tunnel ✓" || \
-    warn "Cel no accesible via tunnel (asegurate que tunnel esté corriendo en el cel)"
+# Instalar backup key y WSL keys en el tunnel user del VPS
+ssh -i "$PEM_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 ubuntu@$VPS_IP \
+    "sudo -u tunnel bash -c '
+        echo \"$WSL_KEYS\" >> /home/tunnel/.ssh/authorized_keys
+        sort -u /home/tunnel/.ssh/authorized_keys -o /home/tunnel/.ssh/authorized_keys
+        chmod 600 /home/tunnel/.ssh/authorized_keys
+    '" 2>/dev/null && log "Llaves también instaladas en tunnel@VPS (ProxyJump) ✓"
 
-# ── Guardar configuración ─────────────────────────────────────
-CONFIG_FILE="$HOME/.phone_backup_${PHONE_NAME}.conf"
-cat > "$CONFIG_FILE" << CONF
-# Config backup ${PHONE_NAME} — $(date '+%Y-%m-%d %H:%M:%S')
+# ── 6. Guardar config maestra ─────────────────────────────────
+MASTER_CONF="$HOME/.mal_master.conf"
+cat > "$MASTER_CONF" << CONF
+# MAL Backup — Config maestra generada $(date '+%Y-%m-%d %H:%M:%S')
 VPS_IP="$VPS_IP"
 VPS_USER="$VPS_USER"
 VPS_SSH_PORT="$VPS_SSH_PORT"
-TUNNEL_PORT="$TUNNEL_PORT"
-CEL_PORT="$CEL_PORT"
-PHONE_USER="$PHONE_USER"
-PHONE_NAME="$PHONE_NAME"
-DEST_DIR="$DEST_DIR"
-SSH_KEY="$SSH_KEY"
 PEM_KEY="$PEM_KEY"
+SSH_KEY="$SSH_KEY"
+BASE_DEST_DIR="$BASE_DEST_DIR"
+LOG="$BASE_DEST_DIR/.master.log"
 CONF
-chmod 600 "$CONFIG_FILE"
-log "Config guardada: $CONFIG_FILE"
+chmod 600 "$MASTER_CONF"
+log "Config maestra guardada: $MASTER_CONF"
 
-# ── Crear daemon de backup ────────────────────────────────────
-DAEMON="$HOME/recolector_${PHONE_NAME}.sh"
+# ── 7. Crear daemon maestro ───────────────────────────────────
+# Un solo daemon que detecta y sincroniza TODOS los cels registrados
+DAEMON="$HOME/recolector_master.sh"
 cat > "$DAEMON" << 'DAEMON_EOF'
 #!/bin/bash
 # ============================================================
-#  RECOLECTOR DAEMON v2.3 — Backup sin borrar archivos del cel
-#  Bugs corregidos:
-#  - localhost en vez de VPS_IP externo
-#  - --itemize-changes en dry-run
-#  - --include="*/" para subdirectorios
-#  - Sin --remove-source-files
-#  - Sin || echo 0
+#  DAEMON MAESTRO v3.0 — Sincroniza TODOS los cels registrados
+#  Lee el registro del VPS automáticamente
+#  Cada cel nuevo en celu.sh se detecta solo
 # ============================================================
 
-SCRIPT_NAME=$(basename "$0" .sh)
-PHONE_NAME="${SCRIPT_NAME#recolector_}"
-CONFIG_FILE="$HOME/.phone_backup_${PHONE_NAME}.conf"
+source "$HOME/.mal_master.conf"
+_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" | tee -a "$LOG"; }
 
-[ ! -f "$CONFIG_FILE" ] && echo "Config no encontrada: $CONFIG_FILE" && exit 1
-source "$CONFIG_FILE"
+SSH_BASE="-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes -o ServerAliveInterval=15"
+SSH_OPTS="$SSH_BASE -i $SSH_KEY -o ProxyJump=${VPS_USER}@${VPS_IP}:${VPS_SSH_PORT}"
 
-LOG="$DEST_DIR/.backup.log"
+mkdir -p "$BASE_DEST_DIR"
 
-# ProxyJump usa la llave del sistema para el salto (no la -i especificada)
-# Por eso se agregó la llave default del WSL al tunnel user en el VPS
-# La conexión final al cel usa localhost (no VPS_IP externo — security group lo bloquea)
-SSH_OPTS="-i $SSH_KEY \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=8 \
-    -o BatchMode=yes \
-    -o ServerAliveInterval=15 \
-    -o ProxyJump=${VPS_USER}@${VPS_IP}:${VPS_SSH_PORT}"
+# Leer registro del VPS
+REGISTRY=$(ssh -i "$PEM_KEY" $SSH_BASE ubuntu@$VPS_IP \
+    "sudo -u tunnel cat /home/tunnel/keys/registry 2>/dev/null" 2>/dev/null)
 
-_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | [$PHONE_NAME] $1" | tee -a "$LOG"; }
+[ -z "$REGISTRY" ] && exit 0
 
-mkdir -p "$DEST_DIR"
+while IFS= read -r LINE; do
+    [[ "$LINE" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "$LINE" ]] && continue
 
-# ── Chequeo: ¿tunnel activo? ─────────────────────────────────
-TUNNEL_ACTIVO=$(ssh -i "$PEM_KEY" \
-    -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
-    ubuntu@$VPS_IP \
-    "ss -tlnp 2>/dev/null | grep -c $TUNNEL_PORT" 2>/dev/null || echo "0")
+    PHONE_ID=$(echo "$LINE"   | awk '{print $1}')
+    TUNNEL_PORT=$(echo "$LINE" | awk '{print $2}')
+    PHONE_NAME=$(echo "$LINE"  | awk '{print $3}')
+    PHONE_USER=$(echo "$LINE"  | awk '{print $4}')
 
-[ "$TUNNEL_ACTIVO" = "0" ] || [ -z "$TUNNEL_ACTIVO" ] && exit 0
+    # ¿Tunnel activo?
+    ACTIVE=$(ssh -i "$PEM_KEY" $SSH_BASE ubuntu@$VPS_IP \
+        "ss -tlnp 2>/dev/null | grep -c ':$TUNNEL_PORT '" 2>/dev/null || echo 0)
+    [[ "$ACTIVE" =~ ^[0-9]+$ ]] || ACTIVE=0
+    [ "$ACTIVE" -eq 0 ] && continue
 
-# ── Chequeo: ¿responde SSH del cel? ──────────────────────────
-ssh $SSH_OPTS -p "$TUNNEL_PORT" "$PHONE_USER@localhost" exit 2>/dev/null || exit 0
+    # ¿SSH responde?
+    ssh $SSH_OPTS -p "$TUNNEL_PORT" "$PHONE_USER@localhost" exit 2>/dev/null || continue
 
-_log "Detectado. Iniciando sync..."
+    DEST="$BASE_DEST_DIR/$PHONE_NAME"
+    LOG_CEL="$DEST/.backup.log"
+    mkdir -p "$DEST"
 
-# ── Leer carpetas desde config remota o escanear ─────────────
-REMOTE_CONFIG=$(ssh $SSH_OPTS -p "$TUNNEL_PORT" "$PHONE_USER@localhost" \
-    "cat ~/storage/shared/.termux_backup_config 2>/dev/null" 2>/dev/null || echo "")
+    _log "$PHONE_NAME conectado (puerto $TUNNEL_PORT)"
 
-declare -a CARPETAS
-if echo "$REMOTE_CONFIG" | grep -q "CARPETAS="; then
-    while IFS= read -r line; do
-        line=$(echo "$line" | tr -d '"' | xargs)
-        [[ "$line" =~ ^storage/ ]] && CARPETAS+=("$line")
-    done <<< "$(echo "$REMOTE_CONFIG" | sed -n '/^CARPETAS=(/,/^)/p' | grep -v 'CARPETAS\|^)$')"
-fi
+    # Leer carpetas del cel
+    REMOTE_CONF=$(ssh $SSH_OPTS -p "$TUNNEL_PORT" "$PHONE_USER@localhost" \
+        "cat ~/storage/shared/.termux_backup_config 2>/dev/null" 2>/dev/null || echo "")
 
-if [ ${#CARPETAS[@]} -eq 0 ]; then
-    _log "Sin config remota, escaneando..."
-    SCAN=$(ssh $SSH_OPTS -p "$TUNNEL_PORT" "$PHONE_USER@localhost" bash << 'SCAN_EOF'
+    declare -a CARPETAS
+    if echo "$REMOTE_CONF" | grep -q "CARPETAS="; then
+        while IFS= read -r C; do
+            C=$(echo "$C" | tr -d '"' | xargs)
+            [[ "$C" =~ ^storage/ ]] && CARPETAS+=("$C")
+        done <<< "$(echo "$REMOTE_CONF" | sed -n '/^CARPETAS=(/,/^)/p' | grep -v 'CARPETAS\|^)$')"
+    fi
+
+    if [ ${#CARPETAS[@]} -eq 0 ]; then
+        SCAN=$(ssh $SSH_OPTS -p "$TUNNEL_PORT" "$PHONE_USER@localhost" bash << 'SCAN_EOF'
 for C in "storage/dcim/Camera" "storage/dcim/Screenshots" "storage/pictures" \
-         "storage/downloads" "storage/movies" \
          "storage/shared/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images" \
          "storage/shared/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video" \
          "storage/shared/Android/media/org.telegram.messenger/Telegram/Telegram Images" \
          "storage/shared/Android/media/org.telegram.messenger/Telegram/Telegram Video" \
-         "storage/shared/Android/media/com.instagram.android/files/videos" \
-         "storage/shared/Android/media/com.instagram.android/files/images" \
-         "storage/shared/DCIM" "storage/shared/Pictures" \
-         "storage/shared/Movies" "storage/shared/Download"; do
-    RUTA="$HOME/$C"
-    [ -d "$RUTA" ] && find "$RUTA" -maxdepth 2 \
+         "storage/shared/DCIM" "storage/shared/Pictures" "storage/shared/Download"; do
+    [ -d "$HOME/$C" ] && find "$HOME/$C" -maxdepth 2 \
         \( -iname "*.jpg" -o -iname "*.png" -o -iname "*.mp4" -o -iname "*.heic" \) \
         2>/dev/null | head -1 | grep -q . && echo "$C"
 done
 SCAN_EOF
-    2>/dev/null)
-    while IFS= read -r line; do [ -n "$line" ] && CARPETAS+=("$line"); done <<< "$SCAN"
-fi
+        2>/dev/null)
+        while IFS= read -r C; do [ -n "$C" ] && CARPETAS+=("$C"); done <<< "$SCAN"
+    fi
 
-[ ${#CARPETAS[@]} -eq 0 ] && _log "No hay carpetas con archivos." && exit 0
+    [ ${#CARPETAS[@]} -eq 0 ] && unset CARPETAS && continue
 
-_log "Sincronizando ${#CARPETAS[@]} carpetas..."
-TOTAL=0
+    TOTAL=0
+    for DIR in "${CARPETAS[@]}"; do
+        DIR=$(echo "$DIR" | xargs)
+        [ -z "$DIR" ] && continue
 
-for DIR in "${CARPETAS[@]}"; do
-    DIR=$(echo "$DIR" | xargs)
-    [ -z "$DIR" ] && continue
-
-    # dry-run con --itemize-changes para contar archivos nuevos correctamente
-    # grep "^>" captura líneas como ">f+++++++++ archivo.jpg"
-    NUEVOS=$(rsync --dry-run -az --itemize-changes \
-        --include="*.jpg" --include="*.jpeg" --include="*.png" \
-        --include="*.mp4" --include="*.mov" --include="*.gif" \
-        --include="*.webp" --include="*.heic" --include="*.3gp" \
-        --include="*/" --exclude="*" --ignore-missing-args \
-        -e "ssh $SSH_OPTS -p $TUNNEL_PORT" \
-        "$PHONE_USER@localhost:~/$DIR/" \
-        "$DEST_DIR/" 2>/dev/null | grep -c "^>")
-
-    if [ "$NUEVOS" -gt 0 ]; then
-        _log "  $DIR ($NUEVOS nuevos)"
-        rsync -az \
+        NUEVOS=$(rsync --dry-run -az --itemize-changes \
             --include="*.jpg" --include="*.jpeg" --include="*.png" \
             --include="*.mp4" --include="*.mov" --include="*.gif" \
             --include="*.webp" --include="*.heic" --include="*.3gp" \
             --include="*/" --exclude="*" --ignore-missing-args \
             -e "ssh $SSH_OPTS -p $TUNNEL_PORT" \
             "$PHONE_USER@localhost:~/$DIR/" \
-            "$DEST_DIR/" >> "$LOG" 2>&1
-        TOTAL=$((TOTAL + NUEVOS))
-    fi
-done
+            "$DEST/" 2>/dev/null | grep -c "^>")
 
-_log "Sync completo. $TOTAL archivos transferidos."
-[ $(stat -c%s "$LOG" 2>/dev/null || echo 0) -gt 2097152 ] && \
-    tail -n 200 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+        if [ "$NUEVOS" -gt 0 ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') | $DIR → $NUEVOS nuevos" >> "$LOG_CEL"
+            rsync -az \
+                --include="*.jpg" --include="*.jpeg" --include="*.png" \
+                --include="*.mp4" --include="*.mov" --include="*.gif" \
+                --include="*.webp" --include="*.heic" --include="*.3gp" \
+                --include="*/" --exclude="*" --ignore-missing-args \
+                -e "ssh $SSH_OPTS -p $TUNNEL_PORT" \
+                "$PHONE_USER@localhost:~/$DIR/" \
+                "$DEST/" >> "$LOG_CEL" 2>&1
+            TOTAL=$((TOTAL + NUEVOS))
+        fi
+    done
+
+    [ "$TOTAL" -gt 0 ] && _log "$PHONE_NAME: $TOTAL archivos → $DEST"
+    unset CARPETAS
+
+done <<< "$REGISTRY"
 DAEMON_EOF
-
 chmod +x "$DAEMON"
-log "Daemon creado: $DAEMON"
+log "Daemon maestro creado: $DAEMON"
 
-# ── Instalar cron para este cel ───────────────────────────────
-info "Instalando cron job..."
+# ── 8. Instalar cron ──────────────────────────────────────────
+info "Instalando cron..."
 sudo apt-get install -y -q cron 2>/dev/null || true
-(crontab -l 2>/dev/null | grep -v "recolector_${PHONE_NAME}"; \
+(crontab -l 2>/dev/null | grep -v recolector_master; \
     echo "*/30 * * * * $DAEMON") | crontab -
 sudo service cron start > /dev/null 2>&1 || true
 
-SHELL_RC="$HOME/.zshrc"; [ ! -f "$SHELL_RC" ] && SHELL_RC="$HOME/.bashrc"
-grep -q "service cron start" "$SHELL_RC" 2>/dev/null || \
-    echo "sudo service cron start > /dev/null 2>&1" >> "$SHELL_RC"
-log "Cron instalado: cada 30 minutos"
+for RC in ~/.zshrc ~/.bashrc; do
+    [ -f "$RC" ] && grep -q "service cron start" "$RC" 2>/dev/null || \
+        echo "sudo service cron start > /dev/null 2>&1" >> "$RC"
+done
+log "Cron cada 30 min"
 
-# ── Primera sync ──────────────────────────────────────────────
-info "Primera sync de ${PHONE_NAME}..."
-bash "$DAEMON" && log "Primera sync OK" || warn "Sync falló (normal si tunnel no activo)"
+# ── 9. Primera sync ───────────────────────────────────────────
+info "Corriendo primera sync..."
+bash "$DAEMON" && log "Primera sync OK" || warn "Sync falló (normal si no hay cels conectados)"
 
 # ── Resumen ───────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   ${PHONE_NAME} CONFIGURADO ✓                                ║${NC}"
+echo -e "${BOLD}║           COMPU CONFIGURADA ✓                       ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${CYAN}Cel            :${NC} ${PHONE_NAME} (${PHONE_USER})"
-echo -e "  ${CYAN}Puerto tunnel  :${NC} ${TUNNEL_PORT}"
-echo -e "  ${CYAN}Destino        :${NC} ${DEST_DIR}"
-echo -e "  ${CYAN}Daemon         :${NC} ${DAEMON}"
-echo -e "  ${CYAN}Fotos borradas :${NC} NO — solo copia, cel intacto"
+echo -e "  ${CYAN}Carpeta base   :${NC} $BASE_DEST_DIR"
+echo -e "  ${CYAN}Daemon maestro :${NC} $DAEMON"
+echo -e "  ${CYAN}Log maestro    :${NC} $BASE_DEST_DIR/.master.log"
+echo -e "  ${CYAN}Frecuencia     :${NC} Cada 30 minutos"
 echo ""
-echo -e "${YELLOW}━━━ TODOS LOS CELULARES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${YELLOW}━━━ CELS REGISTRADOS EN EL VPS ━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-for F in ~/.phone_backup_*.conf; do
-    [ -f "$F" ] || continue
-    N=$(grep "^PHONE_NAME=" "$F" | cut -d'"' -f2)
-    P=$(grep "^TUNNEL_PORT=" "$F" | cut -d'"' -f2)
-    D=$(grep "^DEST_DIR=" "$F" | cut -d'"' -f2)
-    echo -e "  ${GREEN}•${NC} ${N} → puerto ${P} → ${D}"
-done
+ssh -i "$PEM_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes ubuntu@$VPS_IP \
+    "sudo -u tunnel cat /home/tunnel/keys/registry 2>/dev/null | grep -v '^#' | \
+    awk '{printf \"  • %-10s  puerto %-6s  %s\n\", \$3, \$2, \$5}'" 2>/dev/null || \
+    echo "  (no hay cels aún — corré celu.sh en el cel)"
 echo ""
 echo -e "${YELLOW}━━━ COMANDOS ÚTILES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  Sync manual  : ${BOLD}bash $DAEMON${NC}"
-echo -e "  Ver log      : ${BOLD}tail -f $DEST_DIR/.backup.log${NC}"
 echo -e "  Estado VPS   : ${BOLD}ssh -i $PEM_KEY ubuntu@$VPS_IP tunnel_status.sh${NC}"
+echo -e "  Ver registro : ${BOLD}ssh -i $PEM_KEY ubuntu@$VPS_IP 'sudo -u tunnel cat /home/tunnel/keys/registry'${NC}"
+echo ""
+echo -e "${GREEN}  ¡Listo! Cualquier cel que corra celu.sh se detecta solo.${NC}"
 echo ""
