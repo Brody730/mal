@@ -109,7 +109,7 @@ pgrep sshd > /dev/null && log "sshd corriendo en puerto 8022" || err "sshd no ar
 info "Registrando con el VPS... (puede tardar ~10 seg)"
 
 # Escribir bootstrap key a archivo temporal
-BOOTSTRAP_FILE=$(mktemp /tmp/bs_XXXXXX)
+BOOTSTRAP_FILE=$(mktemp "$TMPDIR/bs_XXXXXX")
 printf '%s\n' "$BOOTSTRAP_KEY" > "$BOOTSTRAP_FILE"
 chmod 600 "$BOOTSTRAP_FILE"
 
