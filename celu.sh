@@ -109,7 +109,7 @@ pgrep sshd > /dev/null && log "sshd corriendo en puerto 8022" || err "sshd no ar
 info "Registrando con el VPS... (puede tardar ~10 seg)"
 
 # Escribir bootstrap key a archivo temporal
-BOOTSTRAP_FILE=$(mktemp "$TMPDIR/bs_XXXXXX")
+BOOTSTRAP_FILE="$HOME/.tmp_bootstrap_$$"
 printf '%s\n' "$BOOTSTRAP_KEY" > "$BOOTSTRAP_FILE"
 chmod 600 "$BOOTSTRAP_FILE"
 
@@ -256,3 +256,4 @@ echo -e "${YELLOW}━━━ AUTOSTART ━━━━━━━━━━━━━━
 echo -e "  ${GREEN}✓ Abrís Termux → sshd + tunnel arrancan solos${NC}"
 echo -e "  ${YELLOW}⚡ Tras reboot → instalar Termux:Boot desde F-Droid${NC}"
 echo ""
+
