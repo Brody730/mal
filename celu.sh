@@ -20,7 +20,13 @@ err()  { echo -e "${RED}[ERR]${NC} $1"; exit 1; }
 #  las dos líneas KEYEOF con el output de vps.sh
 # ============================================================
 BOOTSTRAP_KEY=$(cat << 'KEYEOF'
-REPLACE_WITH_BOOTSTRAP_PRIVATE_KEY_FROM_VPS_SH_OUTPUT
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBaWbmCGw6lEO2X43xaui4a/X9CqFaiUSa8ntU9MUMfAQAAAKAjsVjmI7FY
+5gAAAAtzc2gtZWQyNTUxOQAAACBaWbmCGw6lEO2X43xaui4a/X9CqFaiUSa8ntU9MUMfAQ
+AAAEDBaRNxmUhg4MwUvaJSCo/VvTzArLBEr2IKz1Fhbn9TWFpZuYIbDqUQ7ZfjfFq6Lhr9
+f0KoVqJRJrye1T0xQx8BAAAAFmJvb3RzdHJhcEBtYWwtcmVnaXN0ZXIBAgMEBQYH
+-----END OPENSSH PRIVATE KEY-----
 KEYEOF
 )
 
